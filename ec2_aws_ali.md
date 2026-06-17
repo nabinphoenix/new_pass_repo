@@ -1,6 +1,13 @@
-# Launching an EC2 Instance via AWS CLI — Lab Guide
+# Launching an EC2 Instance via AWS CLI — Lab Guide (incl. HaqDeskAI EC2)
 
-This guide documents the full process of launching an EC2 instance from scratch using the AWS CLI, installing Apache on it, and serving a simple HTML page — exactly as performed in this lab session.
+This guide documents two full EC2 launches performed in this lab session:
+
+- **Part 1:** A basic instance (`MyFirstInstance`) launched into the account's default VPC, with Apache installed manually over SSH.
+- **Part 2: HaqDeskAI EC2** — a second instance launched into a **custom-built VPC** (own subnet, internet gateway, route table, and security group), with an attached IAM role and Apache auto-installed via a user data script — no manual SSH setup required.
+
+---
+
+# Part 1: MyFirstInstance (Default VPC)
 
 ---
 
@@ -264,7 +271,7 @@ Page loaded successfully showing:
 
 ---
 
-## Summary of Resources Created
+## Summary of Resources Created (Part 1)
 
 | Resource | Identifier |
 |---|---|
@@ -277,12 +284,304 @@ Page loaded successfully showing:
 
 ---
 
-## Cleanup (when finished with the lab)
+# Part 2: HaqDeskAI EC2 — Custom VPC Launch
 
-```bash
-aws ec2 terminate-instances --instance-ids i-0c9e92c81a6543c56
+This part builds a fully custom network from scratch (instead of relying on the default VPC) and reuses the existing key pair, while creating a new VPC-specific security group and attaching an IAM role. Apache and the HTML page are installed automatically via a **user data** script — no manual SSH setup needed.
+
+### What carries over vs. what needed to be rebuilt
+
+- **Key Pair** (`MyKeyPair`) — reusable as-is; not tied to any VPC.
+- **IAM Role** — reusable as-is; not tied to any VPC.
+- **Security Group** — NOT reusable; security groups are tied to a specific VPC, so a new one had to be created inside the new custom VPC.
+
+---
+
+## Step 13: Find an Available IAM Instance Profile
+
+```powershell
+aws iam list-instance-profiles --query "InstanceProfiles[].InstanceProfileName" --output table
 ```
 
 **Purpose & syntax:**
-- `terminate-instances` permanently shuts down and deletes the instance to stop billing/usage.
-- `--instance-ids` accepts one or more instance IDs to terminate.
+- EC2 doesn't attach an IAM *role* directly — it attaches an **instance profile**, a wrapper/container around a role.
+- `list-instance-profiles` lists every instance profile available in the account.
+- `--query` extracts just the names for a quick readable list.
+
+**Result:** Found two available profiles — `EMR_EC2_DefaultRole` and `LabInstanceProfile`. Chose **`LabInstanceProfile`**.
+
+---
+
+## Step 14: Create the User Data Script (auto-installs Apache on boot)
+
+```powershell
+$script = @'
+#!/bin/bash
+dnf update -y
+dnf install -y httpd
+systemctl start httpd
+systemctl enable httpd
+echo '<html><head><title>HaqDeskAI Server</title></head><body><h1>Hello from HaqDeskAI!</h1><p>Apache was auto-installed via user data.</p></body></html>' > /var/www/html/index.html
+'@
+$script = $script -replace "`r`n", "`n"
+[System.IO.File]::WriteAllText("$PWD\userdata.sh", $script)
+```
+
+**Purpose & syntax:**
+- "User data" is a script EC2 automatically runs as `root` the very first time an instance boots — this is what lets Apache and the HTML page get set up with zero manual SSH steps.
+- The `@' ... '@` block is a PowerShell here-string, letting multi-line text (including nested single quotes) be written literally without PowerShell trying to interpret it.
+- `-replace "\`r\`n", "\`n"` strips Windows-style line endings (CRLF) down to Unix-style (LF), since the script runs inside Linux and mismatched line endings can cause boot script issues.
+- `[System.IO.File]::WriteAllText` writes the cleaned-up script to `userdata.sh`, bypassing PowerShell's usual file-write cmdlets (which would reintroduce CRLF).
+- Inside the script itself: no `sudo` is needed because user data scripts already run as `root` automatically.
+
+**Result:** `userdata.sh` created locally, ready to be passed into `run-instances`.
+
+---
+
+## Step 15: Create a Custom VPC
+
+```powershell
+aws ec2 create-vpc --cidr-block 10.0.0.0/16 --query "Vpc.VpcId" --output text
+```
+
+**Purpose & syntax:**
+- `create-vpc` creates a new isolated virtual network.
+- `--cidr-block 10.0.0.0/16` defines the private IP range for the whole network (65,536 addresses: `10.0.0.0`–`10.0.255.255`).
+
+**Result:**
+```
+VpcId: vpc-06894f02beeaa1fb7
+```
+
+---
+
+## Step 16: Create a Subnet Inside the VPC
+
+```powershell
+aws ec2 create-subnet --vpc-id vpc-06894f02beeaa1fb7 --cidr-block 10.0.1.0/24 --availability-zone us-east-1a --query "Subnet.SubnetId" --output text
+```
+
+**Purpose & syntax:**
+- `create-subnet` carves a smaller IP range out of the VPC where instances actually live.
+- `--cidr-block 10.0.1.0/24` gives this subnet 256 addresses.
+- `--availability-zone` pins the subnet to a specific physical data center location, as AWS requires.
+
+**Result:**
+```
+SubnetId: subnet-00ca6f168cf35ea5d
+```
+
+---
+
+## Step 17: Enable Auto-Assign Public IP on the Subnet
+
+```powershell
+aws ec2 modify-subnet-attribute --subnet-id subnet-00ca6f168cf35ea5d --map-public-ip-on-launch
+```
+
+**Purpose & syntax:**
+- `modify-subnet-attribute` changes a setting on an existing subnet.
+- `--map-public-ip-on-launch` ensures any instance launched into this subnet automatically gets a public IP, instead of only a private one.
+- No output on success.
+
+---
+
+## Step 18: Create an Internet Gateway
+
+```powershell
+aws ec2 create-internet-gateway --query "InternetGateway.InternetGatewayId" --output text
+```
+
+**Purpose & syntax:**
+- An Internet Gateway (IGW) is what lets traffic flow between a VPC and the public internet — a new VPC has none by default.
+- This creates the gateway object (not yet connected to anything).
+
+**Result:**
+```
+InternetGatewayId: igw-0e395f0107387fbc2
+```
+
+---
+
+## Step 19: Attach the Internet Gateway to the VPC
+
+```powershell
+aws ec2 attach-internet-gateway --vpc-id vpc-06894f02beeaa1fb7 --internet-gateway-id igw-0e395f0107387fbc2
+```
+
+**Purpose & syntax:**
+- `attach-internet-gateway` connects the gateway to the VPC — without this, the gateway exists but does nothing.
+- No output on success.
+
+---
+
+## Step 20: Create a Route Table
+
+```powershell
+aws ec2 create-route-table --vpc-id vpc-06894f02beeaa1fb7 --query "RouteTable.RouteTableId" --output text
+```
+
+**Purpose & syntax:**
+- A route table is a set of rules deciding where network traffic gets directed.
+- This creates a new, empty table tied to the VPC.
+
+**Result:**
+```
+RouteTableId: rtb-0bbd1a9ddab658f04
+```
+
+---
+
+## Step 21: Add a Route to the Internet Gateway
+
+```powershell
+aws ec2 create-route --route-table-id rtb-0bbd1a9ddab658f04 --destination-cidr-block 0.0.0.0/0 --gateway-id igw-0e395f0107387fbc2
+```
+
+**Purpose & syntax:**
+- `create-route` adds a rule to the table.
+- `--destination-cidr-block 0.0.0.0/0` matches "any IP whatsoever" — the catch-all for internet-bound traffic.
+- `--gateway-id` sends matching traffic out through the Internet Gateway.
+
+**Result:** `"Return": true` — route added successfully.
+
+---
+
+## Step 22: Associate the Route Table with the Subnet
+
+```powershell
+aws ec2 associate-route-table --subnet-id subnet-00ca6f168cf35ea5d --route-table-id rtb-0bbd1a9ddab658f04
+```
+
+**Purpose & syntax:**
+- A route table only takes effect on subnets it's explicitly linked to.
+- This connects the routing rules to the actual subnet instances will launch into.
+
+**Result:** Associated successfully (`"AssociationState": {"State": "associated"}`).
+
+---
+
+## Step 23: Create a Security Group Inside the New VPC
+
+```powershell
+aws ec2 create-security-group --group-name HaqDeskAI-SG --description "Allow SSH and HTTP" --vpc-id vpc-06894f02beeaa1fb7 --query "GroupId" --output text
+```
+
+**Purpose & syntax:**
+- Same command as before, but `--vpc-id` explicitly ties this new group to the custom VPC instead of the default one — security groups can't be shared across VPCs.
+
+**Result:**
+```
+GroupId: sg-09e1265d8d4b1e208
+```
+
+### Open Port 22 (SSH) and Port 80 (HTTP)
+
+```powershell
+aws ec2 authorize-security-group-ingress --group-id sg-09e1265d8d4b1e208 --protocol tcp --port 22 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id sg-09e1265d8d4b1e208 --protocol tcp --port 80 --cidr 0.0.0.0/0
+```
+
+**Result:** Both rules confirmed via:
+```powershell
+aws ec2 describe-security-group-rules --filters "Name=group-id,Values=sg-09e1265d8d4b1e208" --query "SecurityGroupRules[].[IpProtocol,FromPort,ToPort,CidrIpv4]" --output table
+```
+```
+tcp   22   22   0.0.0.0/0
+tcp   80   80   0.0.0.0/0
+-1    -1   -1   0.0.0.0/0   (default outbound allow-all rule, created automatically)
+```
+
+---
+
+## Step 24: Launch HaqDeskAI Into the Custom VPC
+
+```powershell
+aws ec2 run-instances --image-id ami-083eb03ee8ae87bb1 --instance-type t2.micro --key-name MyKeyPair --subnet-id subnet-00ca6f168cf35ea5d --security-group-ids sg-09e1265d8d4b1e208 --iam-instance-profile Name=LabInstanceProfile --user-data file://userdata.sh --count 1 --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=HaqDeskAI}]'
+```
+
+**Purpose & syntax:**
+- `--subnet-id subnet-00ca6f168cf35ea5d` places the instance directly into the custom subnet — this single flag ties it to the entire custom network (VPC, routing, internet gateway).
+- `--security-group-ids` points to the new VPC-specific security group.
+- `--iam-instance-profile Name=LabInstanceProfile` attaches the IAM role wrapper chosen in Step 13.
+- `--user-data file://userdata.sh` tells EC2 to run the script from Step 14 automatically on first boot — replacing all manual SSH setup.
+- Storage was left at default (no `--block-device-mappings` flag), so it uses the AMI's standard 8 GB root volume.
+
+**Result:**
+```
+InstanceId: i-0fe585cea18544122
+Tag Name: HaqDeskAI
+```
+
+---
+
+## Step 25: Get Instance ID, State & Public IP
+
+```powershell
+aws ec2 describe-instances --filters "Name=tag:Name,Values=HaqDeskAI" --query "Reservations[0].Instances[0].InstanceId" --output text
+aws ec2 describe-instances --instance-ids i-0fe585cea18544122 --query "Reservations[0].Instances[0].[State.Name,PublicIpAddress]" --output table
+```
+
+**Result:**
+```
+State: running
+Public IP: 34.200.214.18
+```
+
+---
+
+## Step 26: Verify in Browser
+
+After waiting 1–2 minutes for the user data script to finish running (`dnf update`, install Apache, write the HTML page) in the background:
+
+```
+http://34.200.214.18
+```
+
+Page loaded successfully showing:
+> **Hello from HaqDeskAI!**
+> Apache was auto-installed via user data.
+
+---
+
+## Summary of Resources Created (Part 2 — HaqDeskAI EC2)
+
+| Resource | Identifier |
+|---|---|
+| VPC | `vpc-06894f02beeaa1fb7` (CIDR `10.0.0.0/16`) |
+| Subnet | `subnet-00ca6f168cf35ea5d` (CIDR `10.0.1.0/24`, `us-east-1a`) |
+| Internet Gateway | `igw-0e395f0107387fbc2` |
+| Route Table | `rtb-0bbd1a9ddab658f04` |
+| Security Group | `sg-09e1265d8d4b1e208` (`HaqDeskAI-SG`) |
+| IAM Instance Profile | `LabInstanceProfile` |
+| Key Pair (reused) | `MyKeyPair` |
+| User Data Script | `userdata.sh` (auto-installs Apache) |
+| AMI Used | `ami-083eb03ee8ae87bb1` (Amazon Linux 2023) |
+| Instance ID | `i-0fe585cea18544122` |
+| Public IP | `34.200.214.18` |
+| Web Server | Apache (httpd), auto-installed via user data |
+
+---
+
+## Cleanup (when finished with the lab)
+
+```bash
+# Terminate both instances
+aws ec2 terminate-instances --instance-ids i-0c9e92c81a6543c56 i-0fe585cea18544122
+```
+
+**Purpose & syntax:**
+- `terminate-instances` permanently shuts down and deletes instances to stop billing/usage.
+- `--instance-ids` accepts a space-separated list, so both instances can be terminated in one call.
+
+If cleaning up the custom network as well (optional, only after both instances are terminated):
+
+```bash
+aws ec2 delete-security-group --group-id sg-09e1265d8d4b1e208
+aws ec2 detach-internet-gateway --vpc-id vpc-06894f02beeaa1fb7 --internet-gateway-id igw-0e395f0107387fbc2
+aws ec2 delete-internet-gateway --internet-gateway-id igw-0e395f0107387fbc2
+aws ec2 delete-subnet --subnet-id subnet-00ca6f168cf35ea5d
+aws ec2 delete-route-table --route-table-id rtb-0bbd1a9ddab658f04
+aws ec2 delete-vpc --vpc-id vpc-06894f02beeaa1fb7
+```
+
+These reverse each creation step in order: detach/delete the gateway, delete the subnet, delete the route table, then finally delete the VPC itself (a VPC can't be deleted while it still has attached resources).
